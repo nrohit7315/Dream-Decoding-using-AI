@@ -1,0 +1,672 @@
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import mne
+import tempfile
+import os
+from pathlib import Path
+from sklearn.preprocessing import MinMaxScaler
+import joblib
+from scipy.signal import welch
+import json
+from pymongo import MongoClient
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from base64 import b64encode
+import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import requests
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont
+from transformers import pipeline, set_seed
+import pyedflib
+
+OUTPUT_DIR = Path(".results/output")
+RECON_DIR = OUTPUT_DIR / "reconstructed"
+TEXT_DIR = OUTPUT_DIR / "text"
+MUSIC_DIR = OUTPUT_DIR / "music"
+ARVR_DIR = OUTPUT_DIR / "ar_vr"
+VIDEO_DIR = OUTPUT_DIR / "video"
+for d in [RECON_DIR, TEXT_DIR, MUSIC_DIR, ARVR_DIR, VIDEO_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+BANDS = {'delta': (0.5, 4), 'theta': (4, 8), 'alpha': (8, 12),
+         'beta': (12, 30), 'gamma': (30, 45)}
+
+class EmotionLSTM(nn.Module):
+    def __init__(self, input_size=1, num_classes=3):
+        super().__init__()
+        self.lstm1 = nn.LSTM(input_size=input_size, hidden_size=128, num_layers=1, batch_first=True)
+        self.lstm2 = nn.LSTM(input_size=128, hidden_size=64, num_layers=1, batch_first=True)
+        self.fc = nn.Linear(64, num_classes)
+    def forward(self, x):
+        out, _ = self.lstm1(x)
+        out, _ = self.lstm2(out)
+        out = self.fc(out[:, -1, :])
+        return out
+
+EMOTION_MODEL_PATH = './results/emotion_model_lstm.pth'
+ML_MODEL_PATH = './results/baseline_models.pkl'
+
+emotion_model = EmotionLSTM()
+emotion_model.load_state_dict(torch.load(EMOTION_MODEL_PATH, map_location='cpu'))
+emotion_model.eval()
+
+ml_pack = joblib.load(ML_MODEL_PATH)
+rf_model = ml_pack['rf']
+scaler = ml_pack['scaler']
+le = ml_pack['le']
+expected_len = ml_pack.get('feature_shape', None)
+
+MONGO_URI = "mongodb://localhost:27017/"
+client = MongoClient(MONGO_URI)
+db = client['eeg_analysis']
+users_collection = db['users']
+
+KEY = get_random_bytes(32)
+
+def encrypt_data(plaintext):
+    cipher = AES.new(KEY, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode())
+    return b64encode(cipher.nonce + tag + ciphertext).decode()
+
+def save_user_info_mongo(user_info, eeg_results):
+    record = {
+        "timestamp": datetime.datetime.utcnow(),
+        "user_info": {k: encrypt_data(str(v)) for k, v in user_info.items()},
+        "eeg_results": eeg_results
+    }
+    users_collection.insert_one(record)
+
+def load_eeg(file_path):
+    raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+    raw.pick_types(eeg=True)
+    return raw
+
+def preprocess_raw(raw):
+    picks = mne.pick_types(raw.info, eeg=True)
+    return raw.get_data(picks=picks)
+
+def epoch_data(data, sfreq, epoch_s=30):
+    n_samples = sfreq * epoch_s
+    n_epochs = data.shape[1] // n_samples
+    return [data[:, i*n_samples:(i+1)*n_samples] for i in range(n_epochs)]
+
+def extract_epoch_features(epoch, sfreq):
+    feats = []
+    for ch in range(epoch.shape[0]):
+        f, Pxx = welch(epoch[ch], sfreq, nperseg=min(256, epoch.shape[1]))
+        total = np.trapz(Pxx, f) + 1e-12
+        for lo, hi in BANDS.values():
+            idx = np.logical_and(f >= lo, f <= hi)
+            feats.append(np.trapz(Pxx[idx], f[idx]) / total)
+    for ch in range(epoch.shape[0]):
+        sig = epoch[ch]
+        diff1 = np.diff(sig)
+        diff2 = np.diff(diff1)
+        var0, var1, var2 = np.var(sig)+1e-12, np.var(diff1)+1e-12, np.var(diff2)+1e-12
+        mobility = np.sqrt(var1/var0)
+        complexity = np.sqrt(var2/var1)/mobility if mobility>0 else 0
+        P = Pxx/(Pxx.sum()+1e-12)
+        ent = -np.sum(P*np.log2(P+1e-12))
+        feats.extend([mobility, complexity, ent])
+    return np.array(feats)
+
+def emotion_predict(raw):
+    raw.filter(0.5, 45, fir_design='firwin', verbose=False)
+    data = raw.get_data()[0]
+    num_samples = 128
+    eeg_segment = data[:num_samples] if len(data) >= num_samples else np.pad(data, (0, num_samples-len(data)))
+    scaled = MinMaxScaler().fit_transform(eeg_segment.reshape(-1,1)).flatten()
+    X_input = torch.tensor(scaled.reshape(1, 128, 1), dtype=torch.float32)
+    with torch.no_grad():
+        logits = emotion_model(X_input)
+        probs = F.softmax(logits, dim=1).numpy().flatten()
+    idx = np.argmax(probs)
+    emotion_map = {0:'Happy 😊', 1:'Fear 😨', 2:'Neutral 😐'}
+    description = {'Happy 😊': "Elevated mood and engagement.",
+                   'Fear 😨': "Anxious or stressed activity detected.",
+                   'Neutral 😐': "Baseline brain rhythm."}
+    return emotion_map[idx], description[emotion_map[idx]], probs
+
+def dream_features(eeg, sf):
+    mean, std = np.mean(eeg), np.std(eeg)
+    bandpower_val = np.mean([np.trapz(welch(eeg[ch], sf, nperseg=sf*2)[1]) for ch in range(eeg.shape[0])])
+    return {"mean":mean, "std":std, "bandpower_1_30Hz":bandpower_val}
+
+def dream_to_text(features):
+    return f"This dream evokes surreal imagery with mean {features['mean']:.2f}, std {features['std']:.2f}, bandpower {features['bandpower_1_30Hz']:.2f}."
+
+PEXELS_API_KEY = "IwJRdJBvv9uKT7sBka8cbKIWAcA5y3n0T5pB224JpDDQnlfN37BpGR4O"
+PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
+
+def fetch_image_for_scene(query, filename):
+    headers = {'Authorization': PEXELS_API_KEY}
+    params = {'query': query, 'per_page': 1}
+    resp = requests.get(PEXELS_SEARCH_URL, headers=headers, params=params)
+    data = resp.json()
+    if data.get('photos'):
+        img_url = data['photos'][0]['src']['landscape']
+        img_data = requests.get(img_url).content
+        with open(filename, 'wb') as f:
+            f.write(img_data)
+        return True
+    return False
+
+def text_to_speech(text, filename):
+    tts = gTTS(text=text, lang='en')
+    tts.save(filename)
+
+st.set_page_config(page_title="EEG Dream & Emotion Analysis", layout="wide")
+st.title("🧠 EEG Dream & Emotion Analysis")
+
+st.header("📝 Enter Your Info")
+name = st.text_input("Full Name")
+age = st.number_input("Age", min_value=1, max_value=120, value=25)
+gender = st.selectbox("Gender", ["Male","Female","Other"])
+user_info_complete = all([name, age, gender])
+
+uploaded_file = st.file_uploader("Upload your EEG EDF file", type=["edf"])
+
+if uploaded_file and user_info_complete:
+    with tempfile.NamedTemporaryFile(delete=False,suffix=".edf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        tmp_path = tmp_file.name
+
+    raw = load_eeg(tmp_path)
+    eeg_data = raw.get_data()*1e6
+    sfreq = int(raw.info['sfreq'])
+
+    f = pyedflib.EdfReader(tmp_path)
+    signal = f.readSignal(0)
+    f.close()
+    fs = 256
+    freqs, psd = welch(signal, fs, nperseg=1024)
+    def band_power(low, high):
+        return np.trapz(psd[(freqs >= low) & (freqs <= high)])
+    delta = band_power(0.5, 4)
+    theta = band_power(4, 8)
+    alpha = band_power(8, 12)
+    beta  = band_power(12, 30)
+    gamma = band_power(30, 45)
+    total_power = delta + theta + alpha + beta + gamma
+    seed_value = int(total_power) % 10000
+
+    generator = pipeline("text-generation", model="gpt2", framework="pt")
+    set_seed(seed_value)
+    dream_prompt = (f"Based on the sleeper's brainwaves:\n"
+                    f"- Delta={delta:.2f}, Theta={theta:.2f}, Alpha={alpha:.2f}, Beta={beta:.2f}, Gamma={gamma:.2f}\n"
+                    f"With seed {seed_value}, write a dream as a short story. Begin with 'Once upon a dream...' and describe in detail:\n\n")
+    dream_text = generator(dream_prompt,max_length=200,num_return_sequences=1,
+                           do_sample=True,top_k=50,top_p=0.95,temperature=0.8)[0]["generated_text"]
+
+    tabs = st.tabs(["Overview","Emotion Analysis","Sleep Stages","Dream Decoding","Music & AR/VR","Dream & Video"])
+
+    with tabs[0]:
+        st.subheader("📊 EEG Summary & Heatmap")
+        st.write(f"Channels: {raw.info['nchan']}, Sampling: {raw.info['sfreq']} Hz, Duration: {raw.n_times/raw.info['sfreq']:.2f}s")
+        fig,ax = plt.subplots(figsize=(10,4))
+        ax.imshow(eeg_data,aspect='auto',cmap='plasma',origin='lower')
+        ax.set_xlabel("Time (samples)")
+        ax.set_ylabel("Channels")
+        st.pyplot(fig)
+
+    with tabs[1]:
+        st.subheader("🎯 Emotion Prediction")
+        emotion, desc, probs = emotion_predict(raw)
+        st.markdown(f"**Predicted Emotion:** {emotion}")
+        st.write(desc)
+        prob_df = pd.DataFrame({"Emotion":['Happy 😊','Fear 😨','Neutral 😐'], "Probability":probs})
+        st.dataframe(prob_df)
+        fig,ax = plt.subplots(figsize=(6,2))
+        bars = ax.barh(prob_df["Emotion"],prob_df["Probability"],color='#7FDBFF')
+        for i,bar in enumerate(bars):
+            ax.text(bar.get_width()+0.01,bar.get_y()+bar.get_height()/2,f"{probs[i]:.2f}",va='center',fontsize=9)
+        st.pyplot(fig)
+
+    with tabs[2]:
+        st.subheader("🛌 Sleep Stage Prediction")
+        data = preprocess_raw(raw)
+        epochs = epoch_data(data, sfreq)
+        feature_list = [extract_epoch_features(ep, sfreq) for ep in epochs]
+        features_array = np.vstack(feature_list)
+        if expected_len and features_array.shape[1] != expected_len:
+            st.error(f"Feature length mismatch: expected {expected_len}, got {features_array.shape[1]}")
+        else:
+            features_scaled = scaler.transform(features_array)
+            preds = rf_model.predict(features_scaled)
+            preds_proba = rf_model.predict_proba(features_scaled)
+            df_stages = pd.DataFrame({"Predicted Stage": le.inverse_transform(preds)})
+            stage_map = {stage:i for i,stage in enumerate(le.classes_)}
+            numeric_stages = df_stages["Predicted Stage"].map(stage_map)
+            fig,ax = plt.subplots(figsize=(10,3))
+            ax.plot(numeric_stages,marker='o')
+            ax.set_yticks(list(stage_map.values()))
+            ax.set_yticklabels(list(stage_map.keys()))
+            ax.set_xlabel("Epoch"); ax.set_ylabel("Sleep Stage"); ax.set_title("Sleep Stage Over Time")
+            st.pyplot(fig)
+            st.dataframe(df_stages)
+            st.bar_chart(pd.DataFrame(preds_proba[-1:], columns=le.classes_))
+
+    with tabs[3]:
+        st.subheader("🌙 Dream Decoding")
+        feats = dream_features(eeg_data, sfreq)
+        dream_description = dream_to_text(feats)
+        st.write(dream_description)
+
+    with tabs[4]:
+        st.subheader("🕶 AR/VR Metadata")
+        arvr_file = ARVR_DIR/"dream_arvr.json"
+        with open(arvr_file, "w") as f:
+            json.dump(feats, f)
+        with open(arvr_file) as f:
+            json_data = json.load(f)
+        st.json(json_data)
+
+    with tabs[5]:
+        st.subheader("🎥 Dream Story & Video")
+        st.write(dream_text)
+
+        width, height = 1280, 720
+        fps = 24
+        duration_per_scene = 5  
+        frames_per_scene = duration_per_scene * fps
+        video_dir = "dream_video_output"
+        os.makedirs(video_dir, exist_ok=True)
+
+        video_path = os.path.join(video_dir, "dream_video.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+
+        try:
+            font = ImageFont.truetype("arial.ttf", 40)
+        except:
+            font = ImageFont.load_default()
+
+        scenes = [s.strip() for s in dream_text.split('.') if s.strip()]
+
+        for i, scene_text in enumerate(scenes):
+            st.write(f"Processing scene {i+1}/{len(scenes)}: {scene_text}")
+
+            img_path = os.path.join(video_dir, f"scene_{i}.jpg")
+            if not fetch_image_for_scene(scene_text, img_path):
+                base_img = Image.new("RGB", (width, height), (0, 0, 0))
+            else:
+                base_img = Image.open(img_path).convert("RGB").resize((width, height))
+
+            draw = ImageDraw.Draw(base_img)
+            bbox = draw.textbbox((0, 0), scene_text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            draw.text(((width - text_w) // 2, height - text_h - 30),
+                      scene_text, font=font, fill="white")
+
+            frame = np.array(base_img)[:, :, ::-1] 
+            for _ in range(frames_per_scene):
+                video.write(frame)
+
+            audio_file = os.path.join(video_dir, f"audio_{i}.mp3")
+            text_to_speech(scene_text, audio_file)
+
+        video.release()
+        cv2.destroyAllWindows()
+
+        st.success(f"✅ Dream video created and stored at: {video_path}")
+        st.video(video_path)
+
+    eeg_results = {"emotion":emotion,"emotion_prob":probs.tolist(),"dream_features":feats,"dream_text":dream_text}
+    save_user_info_mongo({"name":name,"age":age,"gender":gender}, eeg_results)
+    st.success("✅ All info and EEG analysis securely saved to MongoDB.")
+
+    os.remove(tmp_path)
+else:
+    st.info("Fill all your info and upload an EEG EDF file to start analysis.")
+
+
+
+#knn
+import streamlit as st
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import mne
+import tempfile
+import os
+from pathlib import Path
+from sklearn.preprocessing import MinMaxScaler
+import joblib
+from scipy.signal import welch
+import json
+from pymongo import MongoClient
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from base64 import b64encode
+import datetime
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import requests
+from gtts import gTTS
+from PIL import Image, ImageDraw, ImageFont
+from transformers import pipeline, set_seed
+import pyedflib
+from sklearn.cluster import KMeans
+
+
+OUTPUT_DIR = Path("./results/output")
+RECON_DIR = OUTPUT_DIR / "reconstructed"
+TEXT_DIR = OUTPUT_DIR / "text"
+MUSIC_DIR = OUTPUT_DIR / "music"
+ARVR_DIR = OUTPUT_DIR / "ar_vr"
+VIDEO_DIR = OUTPUT_DIR / "video"
+for d in [RECON_DIR, TEXT_DIR, MUSIC_DIR, ARVR_DIR, VIDEO_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+
+BANDS = {'delta': (0.5, 4), 'theta': (4, 8), 'alpha': (8, 12),
+         'beta': (12, 30), 'gamma': (30, 45)}
+
+
+
+
+EMOTION_MODEL_PATH = './results/kmeans_eeg_model.pkl'
+ML_MODEL_PATH = './results/baseline_models.pkl'
+kmeans_model = joblib.load(EMOTION_MODEL_PATH)
+
+
+ml_pack = joblib.load(ML_MODEL_PATH)
+rf_model = ml_pack['rf']
+scaler = ml_pack['scaler']
+le = ml_pack['le']
+expected_len = ml_pack.get('feature_shape', None)
+
+
+MONGO_URI = "mongodb://localhost:27017/"
+client = MongoClient(MONGO_URI)
+db = client['eeg_analysis']
+users_collection = db['users']
+
+KEY = get_random_bytes(32)
+
+def encrypt_data(plaintext):
+    cipher = AES.new(KEY, AES.MODE_EAX)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext.encode())
+    return b64encode(cipher.nonce + tag + ciphertext).decode()
+
+def save_user_info_mongo(user_info, eeg_results):
+    record = {
+        "timestamp": datetime.datetime.utcnow(),
+        "user_info": {k: encrypt_data(str(v)) for k, v in user_info.items()},
+        "eeg_results": eeg_results
+    }
+    users_collection.insert_one(record)
+
+def load_eeg(file_path):
+    raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+    raw.pick_types(eeg=True)
+    return raw
+
+def preprocess_raw(raw):
+    picks = mne.pick_types(raw.info, eeg=True)
+    return raw.get_data(picks=picks)
+
+def epoch_data(data, sfreq, epoch_s=30):
+    n_samples = sfreq * epoch_s
+    n_epochs = data.shape[1] // n_samples
+    return [data[:, i*n_samples:(i+1)*n_samples] for i in range(n_epochs)]
+
+def extract_epoch_features(epoch, sfreq):
+    feats = []
+    for ch in range(epoch.shape[0]):
+        f, Pxx = welch(epoch[ch], sfreq, nperseg=min(256, epoch.shape[1]))
+        total = np.trapz(Pxx, f) + 1e-12
+        for lo, hi in BANDS.values():
+            idx = np.logical_and(f >= lo, f <= hi)
+            feats.append(np.trapz(Pxx[idx], f[idx]) / total)
+    for ch in range(epoch.shape[0]):
+        sig = epoch[ch]
+        diff1 = np.diff(sig)
+        diff2 = np.diff(diff1)
+        var0, var1, var2 = np.var(sig)+1e-12, np.var(diff1)+1e-12, np.var(diff2)+1e-12
+        mobility = np.sqrt(var1/var0)
+        complexity = np.sqrt(var2/var1)/mobility if mobility>0 else 0
+        P = Pxx/(Pxx.sum()+1e-12)
+        ent = -np.sum(P*np.log2(P+1e-12))
+        feats.extend([mobility, complexity, ent])
+    return np.array(feats)
+
+def emotion_predict(raw):
+    raw.filter(0.5, 45, fir_design='firwin', verbose=False)
+    data = raw.get_data()  
+    sfreq = int(raw.info['sfreq'])
+    eeg_signal = data[0, :sfreq] 
+    
+    freqs, psd = welch(eeg_signal, sfreq, nperseg=min(256, len(eeg_signal)))
+    def band_power(lo, hi):
+        return np.trapz(psd[(freqs>=lo)&(freqs<=hi)])
+    
+    features = np.array([
+        band_power(0.5, 4),  
+        band_power(4, 8),    
+        band_power(8, 13),   
+        band_power(13, 45) 
+    ]).reshape(1, -1)  
+    
+    features = features / features.sum() 
+    
+    cluster_idx = kmeans_model.predict(features)[0]
+    
+    cluster_map = {0:'Happy 😊', 1:'Fear 😨', 2:'Neutral 😐'}
+    emotion = cluster_map.get(cluster_idx, "Neutral 😐")
+    
+    description_map = {'Happy 😊': "Elevated mood and engagement.",
+                       'Fear 😨': "Anxious or stressed activity detected.",
+                       'Neutral 😐': "Baseline brain rhythm."}
+    probs = np.zeros(3)
+    probs[cluster_idx] = 1.0
+    
+    return emotion, description_map[emotion], probs
+
+
+
+def dream_features(eeg, sf):
+    mean, std = np.mean(eeg), np.std(eeg)
+    bandpower_val = np.mean([np.trapz(welch(eeg[ch], sf, nperseg=sf*2)[1]) for ch in range(eeg.shape[0])])
+    return {"mean":mean, "std":std, "bandpower_1_30Hz":bandpower_val}
+
+def dream_to_text(features):
+    return f"This dream evokes surreal imagery with mean {features['mean']:.2f}, std {features['std']:.2f}, bandpower {features['bandpower_1_30Hz']:.2f}."
+
+# ---------------- API & Audio ----------------
+PEXELS_API_KEY = "IwJRdJBvv9uKT7sBka8cbKIWAcA5y3n0T5pB224JpDDQnlfN37BpGR4O"
+PEXELS_SEARCH_URL = "https://api.pexels.com/v1/search"
+
+def fetch_image_for_scene(query, filename):
+    headers = {'Authorization': PEXELS_API_KEY}
+    params = {'query': query, 'per_page': 1}
+    resp = requests.get(PEXELS_SEARCH_URL, headers=headers, params=params)
+    data = resp.json()
+    if data.get('photos'):
+        img_url = data['photos'][0]['src']['landscape']
+        img_data = requests.get(img_url).content
+        with open(filename, 'wb') as f:
+            f.write(img_data)
+        return True
+    return False
+
+def text_to_speech(text, filename):
+    tts = gTTS(text=text, lang='en')
+    tts.save(filename)
+
+# ---------------- Streamlit UI ----------------
+st.set_page_config(page_title="EEG Dream & Emotion Analysis", layout="wide")
+st.title("🧠 EEG Dream & Emotion Analysis")
+
+st.header("📝 Enter Your Info")
+name = st.text_input("Full Name")
+age = st.number_input("Age", min_value=1, max_value=120, value=25)
+gender = st.selectbox("Gender", ["Male","Female","Other"])
+user_info_complete = all([name, age, gender])
+
+uploaded_file = st.file_uploader("Upload your EEG EDF file", type=["edf"])
+
+if uploaded_file and user_info_complete:
+    with tempfile.NamedTemporaryFile(delete=False,suffix=".edf") as tmp_file:
+        tmp_file.write(uploaded_file.read())
+        tmp_path = tmp_file.name
+
+    raw = load_eeg(tmp_path)
+    eeg_data = raw.get_data()*1e6
+    sfreq = int(raw.info['sfreq'])
+
+    f = pyedflib.EdfReader(tmp_path)
+    signal = f.readSignal(0)
+    f.close()
+    fs = 256
+    freqs, psd = welch(signal, fs, nperseg=1024)
+    def band_power(low, high):
+        return np.trapz(psd[(freqs >= low) & (freqs <= high)])
+    delta = band_power(0.5, 4)
+    theta = band_power(4, 8)
+    alpha = band_power(8, 12)
+    beta  = band_power(12, 30)
+    gamma = band_power(30, 45)
+    total_power = delta + theta + alpha + beta + gamma
+    seed_value = int(total_power) % 10000
+
+    generator = pipeline("text-generation", model="gpt2", framework="pt")
+    set_seed(seed_value)
+    dream_prompt = (f"Based on the sleeper's brainwaves:\n"
+                    f"- Delta={delta:.2f}, Theta={theta:.2f}, Alpha={alpha:.2f}, Beta={beta:.2f}, Gamma={gamma:.2f}\n"
+                    f"With seed {seed_value}, write a dream as a short story. Begin with 'Once upon a dream...' and describe in detail:\n\n")
+    dream_text = generator(dream_prompt,max_length=200,num_return_sequences=1,
+                           do_sample=True,top_k=50,top_p=0.95,temperature=0.8)[0]["generated_text"]
+
+    tabs = st.tabs(["Overview","Emotion Analysis","Sleep Stages","Dream Decoding","Music & AR/VR","Dream & Video"])
+
+    with tabs[0]:
+        st.subheader("📊 EEG Summary & Heatmap")
+        st.write(f"Channels: {raw.info['nchan']}, Sampling: {raw.info['sfreq']} Hz, Duration: {raw.n_times/raw.info['sfreq']:.2f}s")
+        fig,ax = plt.subplots(figsize=(10,4))
+        ax.imshow(eeg_data,aspect='auto',cmap='plasma',origin='lower')
+        ax.set_xlabel("Time (samples)")
+        ax.set_ylabel("Channels")
+        st.pyplot(fig)
+
+    with tabs[1]:
+        st.subheader("🎯 Emotion Prediction")
+        emotion, desc, probs = emotion_predict(raw)
+        st.markdown(f"**Predicted Emotion:** {emotion}")
+        st.write(desc)
+        prob_df = pd.DataFrame({"Emotion":['Happy 😊','Fear 😨','Neutral 😐'], "Probability":probs})
+        st.dataframe(prob_df)
+        fig,ax = plt.subplots(figsize=(6,2))
+        bars = ax.barh(prob_df["Emotion"],prob_df["Probability"],color='#7FDBFF')
+        for i,bar in enumerate(bars):
+            ax.text(bar.get_width()+0.01,bar.get_y()+bar.get_height()/2,f"{probs[i]:.2f}",va='center',fontsize=9)
+        st.pyplot(fig)
+
+    with tabs[2]:
+        st.subheader("🛌 Sleep Stage Prediction")
+        data = preprocess_raw(raw)
+        epochs = epoch_data(data, sfreq)
+        feature_list = [extract_epoch_features(ep, sfreq) for ep in epochs]
+        features_array = np.vstack(feature_list)
+        if expected_len and features_array.shape[1] != expected_len:
+            st.error(f"Feature length mismatch: expected {expected_len}, got {features_array.shape[1]}")
+        else:
+            features_scaled = scaler.transform(features_array)
+            preds = rf_model.predict(features_scaled)
+            preds_proba = rf_model.predict_proba(features_scaled)
+            df_stages = pd.DataFrame({"Predicted Stage": le.inverse_transform(preds)})
+            stage_map = {stage:i for i,stage in enumerate(le.classes_)}
+            numeric_stages = df_stages["Predicted Stage"].map(stage_map)
+            fig,ax = plt.subplots(figsize=(10,3))
+            ax.plot(numeric_stages,marker='o')
+            ax.set_yticks(list(stage_map.values()))
+            ax.set_yticklabels(list(stage_map.keys()))
+            ax.set_xlabel("Epoch"); ax.set_ylabel("Sleep Stage"); ax.set_title("Sleep Stage Over Time")
+            st.pyplot(fig)
+            st.dataframe(df_stages)
+            st.bar_chart(pd.DataFrame(preds_proba[-1:], columns=le.classes_))
+
+    with tabs[3]:
+        st.subheader("🌙 Dream Decoding")
+        feats = dream_features(eeg_data, sfreq)
+        dream_description = dream_to_text(feats)
+        st.write(dream_description)
+
+    with tabs[4]:
+        st.subheader("🕶 AR/VR Metadata")
+        arvr_file = ARVR_DIR/"dream_arvr.json"
+        with open(arvr_file, "w") as f:
+            json.dump(feats, f)
+        with open(arvr_file) as f:
+            json_data = json.load(f)
+        st.json(json_data)
+
+    with tabs[5]:
+        st.subheader("🎥 Dream Story & Video")
+        st.write(dream_text)
+
+        width, height = 1280, 720
+        fps = 24
+        duration_per_scene = 5  
+        frames_per_scene = duration_per_scene * fps
+        video_dir = "dream_video_output"
+        os.makedirs(video_dir, exist_ok=True)
+
+        video_path = os.path.join(video_dir, "dream_video.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+
+        try:
+            font = ImageFont.truetype("arial.ttf", 40)
+        except:
+            font = ImageFont.load_default()
+
+        scenes = [s.strip() for s in dream_text.split('.') if s.strip()]
+
+        for i, scene_text in enumerate(scenes):
+            st.write(f"Processing scene {i+1}/{len(scenes)}: {scene_text}")
+
+            img_path = os.path.join(video_dir, f"scene_{i}.jpg")
+            if not fetch_image_for_scene(scene_text, img_path):
+                base_img = Image.new("RGB", (width, height), (0, 0, 0))
+            else:
+                base_img = Image.open(img_path).convert("RGB").resize((width, height))
+
+            draw = ImageDraw.Draw(base_img)
+            bbox = draw.textbbox((0, 0), scene_text, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            draw.text(((width - text_w) // 2, height - text_h - 30),
+                      scene_text, font=font, fill="white")
+
+            frame = np.array(base_img)[:, :, ::-1] 
+            for _ in range(frames_per_scene):
+                video.write(frame)
+
+            audio_file = os.path.join(video_dir, f"audio_{i}.mp3")
+            text_to_speech(scene_text, audio_file)
+
+        video.release()
+        cv2.destroyAllWindows()
+
+        st.success(f"✅ Dream video created and stored at: {video_path}")
+        st.video(video_path)
+
+    eeg_results = {"emotion":emotion,"emotion_prob":probs.tolist(),"dream_features":feats,"dream_text":dream_text}
+    save_user_info_mongo({"name":name,"age":age,"gender":gender}, eeg_results)
+    st.success("✅ All info and EEG analysis securely saved to MongoDB.")
+
+    os.remove(tmp_path)
+else:
+    st.info("Fill all your info and upload an EEG EDF file to start analysis.")

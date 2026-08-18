@@ -1,0 +1,22 @@
+streamlit
+numpy==1.23.0
+pandas
+matplotlib
+seaborn
+mne
+scikit-learn
+joblib
+scipy
+pymongo
+pycryptodome
+torch==2.2.2+cpu
+torchvision==0.17.2+cpu
+torchaudio==2.2.2+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+opencv-python
+requests
+gTTS
+Pillow
+transformers
+pyedflib
+python==3.11

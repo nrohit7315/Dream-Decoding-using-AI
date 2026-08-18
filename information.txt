@@ -1,0 +1,147 @@
+# EEG Dream & Emotion Analysis Dashboard
+
+## Overview
+The **EEG Dream & Emotion Analysis Dashboard** is an interactive web application that allows users to analyze their brain activity (EEG) to predict emotions, sleep stages, and dream patterns. The dashboard also generates **dream-inspired images, audio, music, and AR/VR metadata**. All user information and EEG results are securely stored in **MongoDB** in encrypted form to protect privacy.
+
+This project combines **neuroscience, machine learning, and AI-driven creative outputs** to provide insights into subconscious patterns, emotional states, and sleep behavior.
+
+---
+
+## What Does This Project Do?
+
+1. **User Information Collection**
+   - Users provide basic personal and medical information:
+     - Full Name
+     - Age
+     - Gender
+   - This data is **encrypted** using AES before being stored in MongoDB.
+   - Ensures privacy while associating EEG analysis with user profiles.
+
+2. **EEG File Upload**
+   - Users upload EEG recordings in **EDF format** (common EEG data format).
+   - The system reads and preprocesses EEG signals for analysis.
+
+3. **Emotion Detection**
+   - Uses a **pre-trained LSTM neural network** to predict emotional states based on EEG signals:
+     - Happy 😊
+     - Fear 😨
+     - Neutral 😐
+   - Displays:
+     - Predicted emotion
+     - Probability for each emotion
+     - Text description explaining the detected emotional state
+   - Visualized using **bar charts** and **tables**.
+
+4. **Sleep Stage Prediction**
+   - Uses EEG features to classify **sleep stages**:
+     - Awake
+     - N1, N2, N3 (Non-REM stages)
+     - REM
+   - Visualized as:
+     - Line chart showing sleep stage transitions over time
+     - Probability bar chart for the most recent epoch
+   - Powered by a **Random Forest classifier** trained on EEG epochs.
+
+5. **Dream Decoding**
+   - Extracts **EEG-based dream features**:
+     - Mean signal
+     - Standard deviation
+     - Bandpower in key frequency ranges
+   - Generates:
+     - **Dream text description** summarizing subconscious activity
+     - **Dream-inspired image** based on EEG features
+     - **Dream audio waveform** derived from EEG dynamics
+
+6. **Dream Music & AR/VR**
+   - Generates a **music array** inspired by dream EEG features.
+   - Produces **AR/VR metadata** including links to:
+     - Dream image
+     - Dream audio
+     - Dream music
+   - Metadata stored as a JSON file for integration with creative applications.
+
+7. **EEG Statistics & Visualization**
+   - Channel-wise statistics: mean, standard deviation, min, max
+   - **Power Spectral Density (PSD)** visualization
+   - **Correlation heatmap** for EEG features
+   - Helps understand the overall EEG patterns and relationships.
+
+---
+
+## Application Tabs
+
+The dashboard is organized into **6 interactive tabs** for easy navigation:
+
+1. **Overview**
+   - EEG summary
+   - Channel heatmap of EEG signals
+
+2. **Emotion Analysis**
+   - Predicted emotion
+   - Probabilities
+   - Text explanation
+
+3. **Sleep Stages**
+   - Line chart showing sleep stages over time
+   - Stage probabilities
+
+4. **Dream Decoding**
+   - Dream text
+   - Dream image
+   - Dream audio waveform
+
+5. **Music & AR/VR**
+   - AR/VR metadata in JSON format
+
+6. **EEG Stats**
+   - Channel statistics (mean, std, min, max)
+   - PSD plots
+   - Feature correlation heatmap
+
+---
+
+## How It Works
+
+1. **Preprocessing**
+   - EEG signals are read from EDF files using the `MNE` library.
+   - Signals are normalized and prepared for feature extraction.
+
+2. **Feature Extraction**
+   - Extracts features such as:
+     - Power in different EEG frequency bands (Delta, Theta, Alpha, Beta, Gamma)
+     - Signal statistics (mean, std)
+     - Signal complexity measures
+   - Features are used for **sleep stage prediction** and **dream decoding**.
+
+3. **Machine Learning Models**
+   - **Emotion Detection:** LSTM neural network
+   - **Sleep Stage Classification:** Random Forest classifier
+   - Features are scaled using `MinMaxScaler` before predictions.
+
+4. **Dream Simulation**
+   - EEG features are converted into:
+     - Textual description
+     - Visual patterns (images)
+     - Audio waveforms
+     - Music sequences
+   - Provides a creative representation of the subconscious state.
+
+5. **Data Storage**
+   - All results are stored in **MongoDB**:
+     - User information is AES-encrypted
+     - EEG analysis results (emotions, sleep stages, dream features)
+   - Enables secure storage and retrieval for further analysis.
+
+---
+
+## Technologies Used
+
+- **Python**  
+  - Streamlit – Interactive web app  
+  - MNE – EEG preprocessing and analysis  
+  - TensorFlow/Keras – LSTM emotion prediction  
+  - Scikit-learn – Random Forest sleep stage classifier  
+  - Seaborn / Matplotlib – Visualization  
+  - NumPy / Pandas – Data processing  
+- **MongoDB** – Secure database for storing encrypted user data  
+- **PyCryptodome** – AES encryption for personal and medical data 

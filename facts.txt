@@ -1,0 +1,96 @@
+1. User Information Collection & Encryption
+
+The app takes input from the user (name, age, gender) through Streamlit forms.
+Before saving to the database, data is encrypted with AES (Advanced Encryption Standard)
+The encryption process uses a random secret key + initialization vector (IV), then encodes the ciphertext in Base64 for storage.
+Encrypted data is saved in MongoDB using pymongo.
+
+2. EEG File Upload & Preprocessing
+Users upload EDF files (a standard EEG format).
+The app uses the MNE library to read EEG channels and signals.
+Preprocessing steps include:
+    Bandpass filtering (to remove noise and artifacts).
+    Normalization/scaling with MinMaxScaler.
+    Segmenting EEG into epochs (time windows).
+
+
+3. Emotion Detection (LSTM Model)
+The preprocessed EEG signals are reshaped into sequences for the LSTM neural network.
+The trained model predicts the probability of each emotion (Happy, Fear, Neutral).
+The app:
+    Picks the emotion with the highest probability.
+    Displays the probabilities in a bar chart.
+EEG Band Definitions
+
+Standard EEG frequency bands are defined:
+Delta (0.5–4 Hz)
+Theta (4–8 Hz)
+Alpha (8–12 Hz)
+Beta (12–30 Hz)
+Gamma (30–45 Hz)
+These are later used for feature extraction.
+
+Emotion Model (LSTM)
+A 2-layer LSTM neural network (EmotionLSTM) is defined.
+Processing:
+First LSTM → extracts temporal features.
+Second LSTM → refines patterns.
+Fully connected layer → outputs class scores.
+The pre-trained model (emotion_model_lstm.pth) is loaded and set to evaluation mode.
+Output classes: Happy, Fear, Neutral.
+
+4. Sleep Stage Prediction (Random Forest Classifier)
+Features are extracted from EEG epochs:
+Mean, standard deviation.
+Bandpower in Delta, Theta, Alpha, Beta, Gamma frequency bands.
+These features are fed into a Random Forest classifier.
+The output is the predicted sleep stage (Awake, N1, N2, N3, REM).
+The app shows:
+    A line chart of stage transitions over time.
+    A bar chart of stage probabilities
+
+5.  MongoDB + AES Encryption
+A MongoDB client connects to the local database (eeg_analysis).
+User info (name, age, gender) is AES-encrypted before saving.
+EEG results are stored as JSON documents in MongoDB, ensuring privacy + retrievability.
+
+6.  Pexels API & Text-to-Vedio-to-speech
+Uses Pexels API to fetch dream-related images matching story scenes.
+Uses gTTS (Google Text-to-Speech) to generate audio narrations of dream scenes.
+
+
+7.  Streamlit UI Flow
+(a) User Info
+    User enters name, age, and gender.
+    Data is checked for completeness before analysis.
+(b) EEG Upload
+    User uploads an EDF file.
+    App extracts EEG data, converts signals to microvolts, and prepares for processing.
+(c) Seeded Dream Text Generation
+    EEG band powers are computed (Delta–Gamma).
+    Their sum generates a numeric seed for text generation.
+    GPT-2 generates a dream story, starting with "Once upon a dream...".
+(d) Streamlit Tabs
+    Overview{Tab 1}
+        Displays EEG summary (channels, sampling, duration).
+        Shows a heatmap of EEG data.
+    Emotion Analysis {tab 2}
+        Runs LSTM model for emotion prediction.
+        Displays predicted emotion, description, probability table, and probability bar chart.
+    Sleep Stages {tab 3}
+        Extracts features from EEG epochs.
+        Random Forest predicts sleep stages across time.
+        Results shown as a line chart, stage distribution table, and bar chart.
+    Dream Decoding {tab 4}
+        Shows dream description from EEG features.
+        Music & AR/VR
+        Saves dream features to dream_arvr.json.
+        Displays metadata for AR/VR integration.
+    Dream & Video {tab 5}
+        Splits GPT-generated dream text into scenes.
+        For each scene:
+        Fetches related image (via Pexels).
+        Adds scene text as overlay.
+        Generates TTS narration.
+        Compiles frames into a dream video using OpenCV.
+        Final video is shown in the UI.
